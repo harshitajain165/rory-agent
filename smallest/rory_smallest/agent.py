@@ -165,7 +165,7 @@ class _Call:
         self._voiced = False               # caller is mid-utterance
         self._silence_s = 0.0              # audio seconds since the last voiced frame
         self._vad = SileroVad(ACTOR_RATE_HZ)
-        self._pending_transcript: list[str] = []  # final segments since the last dispatched turn
+        self._latest_transcript = ""       # most recent non-empty `is_final` transcript
         self._finalize_ack = asyncio.Event()
         self._turns: asyncio.Queue[str] = asyncio.Queue()
         self._speaking: asyncio.Task | None = None
@@ -249,9 +249,9 @@ class _Call:
         """The caller has stopped: ask Pulse to finalize and collect the turn's text.
 
         Pulse may already have finalized part of the utterance on its own
-        (trailing silence or word count) before this fires, which is why the
-        turn's text is everything accumulated in ``_pending_transcript`` since
-        the last turn, not just this call's response.
+        (trailing silence or word count) before this fires; that is fine
+        because ``_latest_transcript`` always holds the full utterance restated
+        so far, not a fragment to append to — see ``_pump_stt_events``.
         """
         logger.info(f"[turn] endpoint after {self._silence_s:.2f}s of silence — finalizing")
         self._voiced = False
@@ -266,20 +266,25 @@ class _Call:
                 "using the transcript collected so far"
             )
 
-        text = " ".join(self._pending_transcript).strip()
-        self._pending_transcript.clear()
+        text = self._latest_transcript.strip()
+        self._latest_transcript = ""
         logger.info(f"[stt] caller_said: {text}")
         if text:
             await self._turns.put(text)
 
     async def _pump_stt_events(self) -> None:
-        """Transcription events → accumulated turn text.
+        """Transcription events → the turn-in-progress text.
 
-        Every ``is_final`` segment's text is appended — Pulse's finals are
-        discrete newly-settled segments, not a cumulative transcript — and
-        ``_endpoint`` is the only place that turns the accumulation into a
-        turn. Interim (``is_final: false``) events are not acted on; they
-        exist for live captions, which this transport does not render.
+        Verified live (2026-10-14, looping Lightning's own TTS output back
+        into Pulse): an ``is_final`` transcript is the *complete* utterance
+        restated so far, not a new fragment since the previous final — so each
+        one overwrites ``_latest_transcript`` rather than extending it.
+        Overwriting, not appending, also means a later empty-text final (as
+        Pulse sends to acknowledge ``close_stream``) cannot blank out text a
+        real final already captured. ``_endpoint`` is the only place that
+        turns this into a dispatched turn. Interim (``is_final: false``)
+        events are not acted on; they exist for live captions, which this
+        transport does not render.
         """
         async for raw in self._stt:
             try:
@@ -292,7 +297,7 @@ class _Call:
             text = (data.get("transcript") or "").strip()
             if is_final:
                 if text:
-                    self._pending_transcript.append(text)
+                    self._latest_transcript = text
                 self._finalize_ack.set()
 
         raise RuntimeError("Pulse STT closed the stream")

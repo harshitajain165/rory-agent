@@ -30,9 +30,11 @@ transport.
 **STT.** One Pulse WebSocket (`wss://api.smallest.ai/waves/v1/pulse/get_text`)
 held open for the whole call. Caller audio goes up unconverted; Pulse finalizes
 on its own trailing-silence and word-count thresholds as well as on a
-client-sent `{"type": "finalize"}`, so a turn's text is everything accumulated
-in `is_final` segments since the previous turn, not just the response to our
-own finalize request — see `_endpoint` in `agent.py`.
+client-sent `{"type": "finalize"}`. Verified live (looping Lightning's own TTS
+output back into Pulse): each `is_final` event's `transcript` is the complete
+utterance restated so far, not a new fragment since the previous final, so the
+turn's text is the *latest* `is_final` transcript, not a concatenation of
+several — see `_endpoint` and `_pump_stt_events` in `agent.py`.
 
 **LLM.** A non-streaming Electron chat completion per round, with Rory's tools
 registered in the standard OpenAI function-calling shape. Electron can also
