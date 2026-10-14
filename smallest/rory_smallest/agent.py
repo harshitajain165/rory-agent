@@ -41,8 +41,14 @@ from rory_tools.vad import SileroVad
 from .tools import TOOLS
 
 LLM_MODEL = os.environ.get("SMALLEST_LLM_MODEL", "electron")
-TTS_MODEL = os.environ.get("SMALLEST_TTS_MODEL", "lightning-v3.1")
-VOICE = os.environ.get("SMALLEST_VOICE", "sophia")
+# The Pro pool: broadcast-quality voices, dedicated inference capacity, no
+# cloning. Pro is picky about voice/model pairing — confirmed live, a
+# standard-pool voice like "sophia" on this model is rejected outright by the
+# API ("Voice 'sophia' is not available on the lightning_v3.1_pro model")
+# rather than silently producing wrong audio, so VOICE must name a voice
+# actually in the Pro pool.
+TTS_MODEL = os.environ.get("SMALLEST_TTS_MODEL", "lightning_v3.1_pro")
+VOICE = os.environ.get("SMALLEST_VOICE", "meher")
 LANGUAGE = os.environ.get("SMALLEST_LANGUAGE", "en")
 
 LLM_BASE_URL = "https://api.smallest.ai/waves/v1"
@@ -67,6 +73,12 @@ STT_URL = "wss://api.smallest.ai/waves/v1/pulse/get_text?" + urlencode(
         "diarize": "false",
     }
 )
+
+# The unified streaming route — not the older per-model path
+# (`/waves/v1/{model}/get_speech/stream`), which Smallest's own docs flag as
+# deprecated. The model is a body field here rather than part of the URL, so
+# switching SMALLEST_TTS_MODEL needs no URL change.
+TTS_URL = "wss://api.smallest.ai/waves/v1/tts/live"
 
 # End of the caller's turn: this much silence, matching the 0.8 s the Pipecat
 # and Gemini candidates land at. Measured in *audio* time — silent bytes seen —
@@ -112,10 +124,6 @@ _llm: AsyncOpenAI
 
 def _auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {os.environ['SMALLEST_API_KEY']}"}
-
-
-def _tts_url() -> str:
-    return f"wss://api.smallest.ai/waves/v1/{TTS_MODEL}/get_speech/stream"
 
 
 async def resolve_vendor() -> None:
@@ -440,10 +448,11 @@ class _Call:
         reply to collide with.
         """
         t0 = time.monotonic()
-        async with websockets.connect(_tts_url(), additional_headers=_auth_headers()) as ws:
+        async with websockets.connect(TTS_URL, additional_headers=_auth_headers()) as ws:
             await ws.send(json.dumps({
                 "text": text,
                 "voice_id": VOICE,
+                "model": TTS_MODEL,
                 "language": LANGUAGE,
                 "sample_rate": ACTOR_RATE_HZ,
             }))

@@ -21,8 +21,8 @@ transport.
 | `SMALLEST_API_KEY` | required — Pulse, Electron and Lightning, boot fails without it |
 | `STRIPE_API_KEY` | required — sandbox fixture; the billing twin's credential |
 | `SMALLEST_LLM_MODEL` | `electron` |
-| `SMALLEST_TTS_MODEL` | `lightning-v3.1` |
-| `SMALLEST_VOICE` | `sophia` |
+| `SMALLEST_TTS_MODEL` | `lightning_v3.1_pro` — the premium pool: broadcast-quality voices, dedicated inference capacity, no cloning |
+| `SMALLEST_VOICE` | `meher` — must be a voice in the Pro pool; confirmed live that a standard-pool voice (e.g. `sophia`) is rejected outright on this model, not silently mispaired |
 | `SMALLEST_LANGUAGE` | `en` |
 
 ## Pipeline
@@ -44,11 +44,13 @@ transport does not use that: the shared `agent_desc.txt` is loaded verbatim
 does not get to ask the model for different behaviour than the others are
 asked for.
 
-**TTS.** Lightning's WebSocket (`wss://api.smallest.ai/.../get_speech/stream`)
-takes one utterance per connection — there is no documented way to abandon an
-utterance mid-stream and reuse the socket — so this transport opens a fresh
-connection per reply and closes it once Lightning reports `"status": "complete"`.
-Audio chunks are decoded and forwarded to the actor as they arrive.
+**TTS.** Lightning's unified streaming WebSocket (`wss://api.smallest.ai/waves/v1/tts/live`,
+`model` as a body field rather than part of the URL — the older per-model path
+Smallest's docs flag as deprecated) takes one utterance per connection — there
+is no documented way to abandon an utterance mid-stream and reuse the socket —
+so this transport opens a fresh connection per reply and closes it once
+Lightning reports `"status": "complete"`. Audio chunks are decoded and
+forwarded to the actor as they arrive.
 
 ## Turn-taking and barge-in
 
