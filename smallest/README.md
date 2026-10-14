@@ -22,7 +22,7 @@ transport.
 | `STRIPE_API_KEY` | required — sandbox fixture; the billing twin's credential |
 | `SMALLEST_LLM_MODEL` | `electron` |
 | `SMALLEST_TTS_MODEL` | `lightning_v3.1_pro` — the premium pool: broadcast-quality voices, dedicated inference capacity, no cloning |
-| `SMALLEST_VOICE` | `meher` — must be a voice in the Pro pool; confirmed live that a standard-pool voice (e.g. `sophia`) is rejected outright on this model, not silently mispaired |
+| `SMALLEST_VOICE` | `kelsey` — must be a voice in the Pro pool; confirmed live that a standard-pool voice (e.g. `sophia`) is rejected outright on this model, not silently mispaired |
 | `SMALLEST_LANGUAGE` | `en` |
 
 ## Pipeline

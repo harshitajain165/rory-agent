@@ -48,7 +48,7 @@ LLM_MODEL = os.environ.get("SMALLEST_LLM_MODEL", "electron")
 # rather than silently producing wrong audio, so VOICE must name a voice
 # actually in the Pro pool.
 TTS_MODEL = os.environ.get("SMALLEST_TTS_MODEL", "lightning_v3.1_pro")
-VOICE = os.environ.get("SMALLEST_VOICE", "meher")
+VOICE = os.environ.get("SMALLEST_VOICE", "kelsey")
 LANGUAGE = os.environ.get("SMALLEST_LANGUAGE", "en")
 
 LLM_BASE_URL = "https://api.smallest.ai/waves/v1"
