@@ -177,6 +177,7 @@ class _Call:
         self._finalize_ack = asyncio.Event()
         self._turns: asyncio.Queue[str] = asyncio.Queue()
         self._speaking: asyncio.Task | None = None
+        self._endpointing: asyncio.Task | None = None  # in-flight _endpoint(), if any
         self._sent_bytes = 0  # PCM16 of the in-flight reply handed to the actor
 
     async def run(self) -> None:
@@ -196,6 +197,9 @@ class _Call:
             for task in tasks:
                 if not task.done():
                     task.cancel()
+            if self._endpointing is not None and not self._endpointing.done():
+                self._endpointing.cancel()
+                tasks.append(self._endpointing)
             await asyncio.gather(*tasks, return_exceptions=True)
             await self._stt.close()
 
@@ -225,7 +229,18 @@ class _Call:
                 elif self._voiced:
                     self._silence_s += len(frame) / 2 / ACTOR_RATE_HZ
                     if self._silence_s >= END_OF_TURN_S:
-                        await self._endpoint()
+                        # Fire-and-forget: Smallest's own reference client sends
+                        # audio and reads responses as two independent tasks and
+                        # never pauses the sender to wait on one — awaiting
+                        # _endpoint() inline here would stall this loop (and with
+                        # it, Pulse ingestion and barge-in detection) for up to
+                        # FINALIZE_TIMEOUT_S on every single turn. Reset the
+                        # state that guards re-entry now, synchronously, so a
+                        # later silent frame can't schedule a second endpoint
+                        # before this one has even started running.
+                        self._voiced = False
+                        self._silence_s = 0.0
+                        self._endpointing = asyncio.create_task(self._endpoint())
 
                 await self._stt.send(frame)
         except WebSocketDisconnect as exc:
@@ -256,14 +271,18 @@ class _Call:
     async def _endpoint(self) -> None:
         """The caller has stopped: ask Pulse to finalize and collect the turn's text.
 
+        Runs as its own task, not awaited inline by the audio pump — Smallest's
+        own reference client keeps sending audio on a task independent of the
+        one reading responses, and never blocks the sender on a reply. Pulse
+        also keeps the session open across a finalize, so there is nothing to
+        pause audio for regardless.
+
         Pulse may already have finalized part of the utterance on its own
         (trailing silence or word count) before this fires; that is fine
         because ``_latest_transcript`` always holds the full utterance restated
         so far, not a fragment to append to — see ``_pump_stt_events``.
         """
-        logger.info(f"[turn] endpoint after {self._silence_s:.2f}s of silence — finalizing")
-        self._voiced = False
-        self._silence_s = 0.0
+        logger.info("[turn] endpoint — finalizing")
         self._finalize_ack.clear()
         await self._stt.send(json.dumps({"type": "finalize"}))
         try:
