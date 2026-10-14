@@ -1,0 +1,469 @@
+"""Rory on Smallest AI's voice stack — Acme Energy's voice support agent, cascaded.
+
+Listens on ``/voice`` for one bidirectional PCM16 stream from the Veris actor.
+Smallest ships the three legs of a voice agent as separate products rather
+than one session, so this process *is* the pipeline: Pulse transcribes the
+caller over a WebSocket, Electron — Smallest's OpenAI-compatible chat model —
+reasons over the transcript and calls Rory's 16 tools, and Lightning speaks
+the reply back over a second WebSocket, one connection per utterance.
+Turn-taking, barge-in and conversation state live here — no vendor holds the
+session. One API key (``SMALLEST_API_KEY``) covers all three legs.
+
+Everything below the transport is shared with the other agents — same prompt,
+same greeting, same frozen-clock date context, same tools, same dispatcher. The
+candidates exist to be compared, so the transport is the only thing allowed to
+differ.
+
+Sample-rate note: the Veris actor speaks and listens at 24 kHz PCM16. Pulse's
+live endpoint and Lightning both accept 24 kHz directly, so — unlike the
+Mistral and Hugging Face cascades — no audio is resampled anywhere in this
+file.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+import os
+import time
+from urllib.parse import urlencode
+
+import websockets
+from loguru import logger
+from openai import AsyncOpenAI
+from starlette.websockets import WebSocket, WebSocketDisconnect
+
+from rory_tools import CallSession, dispatch
+from rory_tools.prompt import GREETING, load_agent_prompt, today_context
+from rory_tools.vad import SileroVad
+
+from .tools import TOOLS
+
+LLM_MODEL = os.environ.get("SMALLEST_LLM_MODEL", "electron")
+TTS_MODEL = os.environ.get("SMALLEST_TTS_MODEL", "lightning-v3.1")
+VOICE = os.environ.get("SMALLEST_VOICE", "sophia")
+LANGUAGE = os.environ.get("SMALLEST_LANGUAGE", "en")
+
+LLM_BASE_URL = "https://api.smallest.ai/waves/v1"
+
+# The Veris actor speaks and listens at 24 kHz PCM16. Pulse's live endpoint
+# accepts 8000/16000/22050/24000/44100/48000 Hz and Lightning can be asked for
+# any of those too, so the actor's own rate is used end to end.
+ACTOR_RATE_HZ = 24000
+PCM16_BYTES_PER_MS = ACTOR_RATE_HZ * 2 // 1000
+
+STT_URL = "wss://api.smallest.ai/waves/v1/pulse/get_text?" + urlencode(
+    {
+        "language": LANGUAGE,
+        "encoding": "linear16",
+        "sample_rate": ACTOR_RATE_HZ,
+        "word_timestamps": "false",
+        "full_transcript": "false",
+        "sentence_timestamps": "false",
+        "redact_pii": "false",
+        "redact_pci": "false",
+        "numerals": "auto",
+        "diarize": "false",
+    }
+)
+
+# End of the caller's turn: this much silence, matching the 0.8 s the Pipecat
+# and Gemini candidates land at. Measured in *audio* time — silent bytes seen —
+# not the wall clock, for the same reason the Mistral cascade does: frames do
+# not arrive at a steady rate, and a wall-clock timer would endpoint mid-burst.
+END_OF_TURN_S = 0.8
+
+# Pulse finalizes on trailing silence, on word count, and on a client-sent
+# `finalize` message — so a turn can already be closed by the time our own
+# silence timer fires. How long to wait for Pulse to acknowledge our request
+# (another `is_final` transcript event) before giving up and using whatever
+# text has arrived so far, rather than stalling the call.
+FINALIZE_TIMEOUT_S = 1.5
+
+# Whether the caller is speaking comes from Silero VAD (rory_tools.vad), not
+# frame energy: the bench mixes cafe and television audio under the caller,
+# and an energy gate hears that as a caller who never stops talking.
+
+# How long a word of the reply takes Lightning to say — a nominal estimate,
+# not a measured one (unlike the Mistral and xAI cascades' TTS_MS_PER_WORD,
+# this has not been benchmarked against the deployed voice). Needed because a
+# barge-in cancels the TTS connection mid-reply, and Lightning's `chunk`
+# frames carry no text alignment of their own. Lightning's WebSocket supports
+# `word_timestamps` for English/Hindi voices, which would replace this
+# estimate with an exact cut — worth adding once this transport has a
+# benchmarked voice to measure against.
+TTS_MS_PER_WORD = 350
+
+# Appended to a reply the caller talked over, in place of the words that were
+# never sent, so the model reads its own history as cut off rather than said.
+INTERRUPTED_MARKER = "… [interrupted by the caller]"
+
+# A turn that still wants tools after this many round trips is looping.
+MAX_TOOL_ROUNDS = 5
+
+# Roughly one heartbeat per second at 20 ms frames.
+LOG_EVERY_N_FRAMES = 50
+
+AGENT_PROMPT = load_agent_prompt()
+
+_llm: AsyncOpenAI
+
+
+def _auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {os.environ['SMALLEST_API_KEY']}"}
+
+
+def _tts_url() -> str:
+    return f"wss://api.smallest.ai/waves/v1/{TTS_MODEL}/get_speech/stream"
+
+
+async def resolve_vendor() -> None:
+    """Build the shared Electron client once per process, after the credential check."""
+    global _llm
+    _llm = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=os.environ["SMALLEST_API_KEY"])
+    logger.info(f"[startup] stt=pulse llm={LLM_MODEL} tts={TTS_MODEL} voice={VOICE}")
+
+
+async def run_voice_ws_bot(actor_ws: WebSocket) -> None:
+    """One actor connection ↔ one Pulse session with Rory's tools."""
+    peer = f"{actor_ws.client.host}:{actor_ws.client.port}" if actor_ws.client else "?"
+    logger.info(f"[voice] actor connected peer={peer}")
+
+    t_start = time.monotonic()
+    try:
+        await _Call(actor_ws).run()
+    finally:
+        logger.info(f"[voice] handler exit duration={time.monotonic() - t_start:.1f}s")
+
+
+class _Call:
+    """The pipeline for one call: STT stream in, LLM turn, TTS connection out.
+
+    Three tasks run concurrently against this state — the actor→STT audio pump
+    (which also does VAD and endpointing), the STT event loop, and a turn
+    worker. Turns are processed one at a time off a queue, so the message list
+    is only ever touched by the worker even when the caller talks over a reply.
+
+    A fresh ``CallSession`` per call, exactly as the Pipecat agent builds one
+    per ``PipelineTask``: it holds the account ``verify_caller`` matched and
+    dies with the call, so identity never becomes a model argument.
+    """
+
+    def __init__(self, actor_ws: WebSocket) -> None:
+        self.actor_ws = actor_ws
+        self.session = CallSession()
+        # The date context is a second system message rather than part of
+        # ``agent_desc.txt`` because it is resolved per call, off the frozen
+        # clock the attempt restored with its snapshot.
+        self.messages: list = [
+            {"role": "system", "content": AGENT_PROMPT},
+            {"role": "system", "content": today_context()},
+        ]
+
+        self._stt = None
+        self._voiced = False               # caller is mid-utterance
+        self._silence_s = 0.0              # audio seconds since the last voiced frame
+        self._vad = SileroVad(ACTOR_RATE_HZ)
+        self._pending_transcript: list[str] = []  # final segments since the last dispatched turn
+        self._finalize_ack = asyncio.Event()
+        self._turns: asyncio.Queue[str] = asyncio.Queue()
+        self._speaking: asyncio.Task | None = None
+        self._sent_bytes = 0  # PCM16 of the in-flight reply handed to the actor
+
+    async def run(self) -> None:
+        self._stt = await websockets.connect(STT_URL, additional_headers=_auth_headers())
+        logger.info(f"[voice] Pulse connected rate={ACTOR_RATE_HZ}Hz")
+
+        tasks = [
+            asyncio.create_task(self._pump_actor_to_stt(), name="actor->stt"),
+            asyncio.create_task(self._pump_stt_events(), name="stt->turns"),
+            asyncio.create_task(self._turn_worker(), name="turns"),
+        ]
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await self._stt.close()
+
+    async def _pump_actor_to_stt(self) -> None:
+        """Binary PCM16 frames from the actor (24 kHz) → Pulse (24 kHz), unconverted.
+
+        Doubles as the turn detector: Silero scores every frame for speech,
+        which drives both barge-in and the turn endpoint.
+
+        The actor streams continuously, silence included, which is also what
+        keeps the session alive.
+        """
+        n_frames = 0
+        n_bytes = 0
+        try:
+            while True:
+                frame = await self.actor_ws.receive_bytes()
+                n_frames += 1
+                n_bytes += len(frame)
+                if n_frames == 1:
+                    logger.info(f"[a->stt] first frame bytes={len(frame)}")
+                elif n_frames % LOG_EVERY_N_FRAMES == 0:
+                    logger.info(f"[a->stt] forwarded {n_frames} frames ({n_bytes} bytes @24kHz)")
+
+                if self._vad.push(frame):
+                    self._on_voice()
+                elif self._voiced:
+                    self._silence_s += len(frame) / 2 / ACTOR_RATE_HZ
+                    if self._silence_s >= END_OF_TURN_S:
+                        await self._endpoint()
+
+                await self._stt.send(frame)
+        except WebSocketDisconnect as exc:
+            logger.info(
+                f"[a->stt] actor disconnected after {n_frames} frames "
+                f"({n_bytes} bytes): code={getattr(exc, 'code', '?')}"
+            )
+        except KeyError as exc:
+            # Starlette raises KeyError('bytes') when it got a text frame instead of
+            # a binary one — a protocol mismatch on the actor side, not a bug here.
+            logger.error(
+                f"[a->stt] non-binary frame after {n_frames} binary frames — "
+                f"actor protocol mismatch? ({exc})"
+            )
+            raise
+
+    def _on_voice(self) -> None:
+        """A speech frame arrived: open the turn, and cut off any reply in progress."""
+        self._silence_s = 0.0
+        if self._voiced:
+            return
+        self._voiced = True
+        logger.info("[vad] caller started speaking")
+        if self._speaking is not None and not self._speaking.done():
+            logger.info("[vad] barge-in — cutting the reply short")
+            self._speaking.cancel()
+
+    async def _endpoint(self) -> None:
+        """The caller has stopped: ask Pulse to finalize and collect the turn's text.
+
+        Pulse may already have finalized part of the utterance on its own
+        (trailing silence or word count) before this fires, which is why the
+        turn's text is everything accumulated in ``_pending_transcript`` since
+        the last turn, not just this call's response.
+        """
+        logger.info(f"[turn] endpoint after {self._silence_s:.2f}s of silence — finalizing")
+        self._voiced = False
+        self._silence_s = 0.0
+        self._finalize_ack.clear()
+        await self._stt.send(json.dumps({"type": "finalize"}))
+        try:
+            await asyncio.wait_for(self._finalize_ack.wait(), timeout=FINALIZE_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[stt] finalize not acknowledged within {FINALIZE_TIMEOUT_S}s — "
+                "using the transcript collected so far"
+            )
+
+        text = " ".join(self._pending_transcript).strip()
+        self._pending_transcript.clear()
+        logger.info(f"[stt] caller_said: {text}")
+        if text:
+            await self._turns.put(text)
+
+    async def _pump_stt_events(self) -> None:
+        """Transcription events → accumulated turn text.
+
+        Every ``is_final`` segment's text is appended — Pulse's finals are
+        discrete newly-settled segments, not a cumulative transcript — and
+        ``_endpoint`` is the only place that turns the accumulation into a
+        turn. Interim (``is_final: false``) events are not acted on; they
+        exist for live captions, which this transport does not render.
+        """
+        async for raw in self._stt:
+            try:
+                data = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                logger.warning(f"[stt] non-JSON message: {raw!r}")
+                continue
+
+            is_final = bool(data.get("is_final"))
+            text = (data.get("transcript") or "").strip()
+            if is_final:
+                if text:
+                    self._pending_transcript.append(text)
+                self._finalize_ack.set()
+
+        raise RuntimeError("Pulse STT closed the stream")
+
+    async def _turn_worker(self) -> None:
+        """Greet, then process caller turns strictly one at a time.
+
+        The greeting runs here rather than before the pumps start so that actor
+        audio is being consumed from the first frame — speaking it inline would
+        let three seconds of caller audio pile up in the socket.
+        """
+        # Rory speaks first. Spoken straight through TTS rather than asked of
+        # the LLM, as Pipecat does, so the opening words are verbatim and the
+        # first turn costs no completion. Seeded as the first assistant turn so
+        # the model knows it has already greeted and doesn't repeat it, and
+        # seeded before it is spoken, like every reply, so a caller talking
+        # over it trims it too.
+        logger.info("[turn] speaking greeting (agent greets first)")
+        self.messages.append({"role": "assistant", "content": GREETING})
+        await self._speak(GREETING)
+
+        while True:
+            text = await self._turns.get()
+            await self._take_turn(text)
+
+    async def _take_turn(self, text: str) -> None:
+        """One caller turn: LLM (with tools) → spoken reply."""
+        self.messages.append({"role": "user", "content": text})
+
+        for _ in range(MAX_TOOL_ROUNDS):
+            t0 = time.monotonic()
+            resp = await _llm.chat.completions.create(
+                model=LLM_MODEL,
+                messages=self.messages,
+                tools=TOOLS,
+                tool_choice="auto",
+            )
+            msg = resp.choices[0].message
+            assistant_message: dict = {"role": "assistant", "content": msg.content}
+            if msg.tool_calls:
+                assistant_message["tool_calls"] = [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        },
+                    }
+                    for call in msg.tool_calls
+                ]
+            self.messages.append(assistant_message)
+            logger.info(
+                f"[llm] {LLM_MODEL} replied in {time.monotonic() - t0:.2f}s "
+                f"({len(msg.tool_calls or [])} tool calls)"
+            )
+            if not msg.tool_calls:
+                break
+            # One at a time, in the order emitted: calls share verification and
+            # payment state on the session.
+            for call in msg.tool_calls:
+                self.messages.append(await self._run_tool(call))
+        else:
+            raise RuntimeError(f"tool loop did not settle in {MAX_TOOL_ROUNDS} rounds")
+
+        if msg.content:
+            logger.info(f"[llm] rory_said: {msg.content}")
+            await self._speak(str(msg.content))
+
+    async def _run_tool(self, call) -> dict:
+        """Dispatch one tool call and build the tool message for the next round."""
+        name = call.function.name
+        args = json.loads(call.function.arguments) if call.function.arguments else {}
+        # Every vendor client is blocking, and this coroutine shares the loop
+        # carrying the caller's audio. Called inline, a ten-second vendor
+        # timeout is ten seconds of dead air — the same reason the Pipecat
+        # handler hops threads.
+        result = await asyncio.to_thread(dispatch, self.session, name, args)
+        logger.info(f"[tool] {name} -> {json.dumps(result, default=str)}")
+        return {
+            "role": "tool",
+            "name": name,
+            "tool_call_id": call.id,
+            "content": json.dumps(result, default=str),
+        }
+
+    async def _speak(self, text: str) -> None:
+        """Speak the last assistant message, cancellable by barge-in.
+
+        ``text`` is that message's content, already on ``messages`` so a
+        barge-in can cut it down to what the caller heard.
+        """
+        self._sent_bytes = 0
+        self._speaking = asyncio.create_task(self._speak_now(text))
+        try:
+            await self._speaking
+        except asyncio.CancelledError:
+            # Barge-in cancels only the TTS task, and the worker carries on to
+            # the caller's next turn. A cancel aimed at the worker itself (the
+            # call ending mid-reply) lands here too, and swallowing that would
+            # leave the worker parked on the queue forever.
+            if asyncio.current_task().cancelling():
+                raise
+            self._trim_interrupted_reply(text)
+        finally:
+            self._speaking = None
+
+    def _trim_interrupted_reply(self, text: str) -> None:
+        """Rewrite the last assistant message to the part of ``text`` that went out.
+
+        Without this the history says Rory told the caller things they never
+        heard, and the next turn reasons from that. Lightning's `chunk`
+        messages carry no sentence boundaries, so the cut is proportional over
+        the reply's words: the PCM sent to the actor, in ms, against the
+        reply's length at TTS_MS_PER_WORD. Bytes handed to the actor count as
+        heard; the connection is unpaced, so that is an upper bound on what
+        was played.
+        """
+        if self._sent_bytes == 0:
+            self.messages.pop()
+            logger.info("[voice] barge-in: dropped reply, nothing sent before the cut")
+            return
+        heard_ms = self._sent_bytes // PCM16_BYTES_PER_MS
+        words = text.split()
+        total_ms = len(words) * TTS_MS_PER_WORD
+        kept = " ".join(words[: heard_ms // TTS_MS_PER_WORD])
+        self.messages[-1] = {"role": "assistant", "content": f"{kept}{INTERRUPTED_MARKER}"}
+        logger.info(
+            f'[voice] barge-in: trimmed reply to {heard_ms} ms / {total_ms} ms ("{kept[:60]}")'
+        )
+
+    async def _speak_now(self, text: str) -> None:
+        """One Lightning utterance: a fresh connection, closed when it completes.
+
+        Unlike Pulse, Lightning's WebSocket takes one utterance per connection
+        rather than a session held for the whole call — there is no documented
+        way to abandon an utterance mid-stream and reuse the socket cleanly, so
+        a barge-in cancelling this coroutine simply closes the connection
+        (the ``async with`` below) rather than leaving stale audio for the next
+        reply to collide with.
+        """
+        t0 = time.monotonic()
+        async with websockets.connect(_tts_url(), additional_headers=_auth_headers()) as ws:
+            await ws.send(json.dumps({
+                "text": text,
+                "voice_id": VOICE,
+                "language": LANGUAGE,
+                "sample_rate": ACTOR_RATE_HZ,
+            }))
+            n_chunks = 0
+            n_bytes = 0
+            async for raw in ws:
+                msg = json.loads(raw)
+                status = msg.get("status")
+                if status == "chunk":
+                    pcm16 = base64.b64decode(msg["data"]["audio"])
+                    n_chunks += 1
+                    n_bytes += len(pcm16)
+                    if n_chunks == 1:
+                        logger.info(
+                            f"[tts] first chunk after {time.monotonic() - t0:.2f}s ({len(pcm16)} bytes)"
+                        )
+                    await self.actor_ws.send_bytes(pcm16)
+                    self._sent_bytes += len(pcm16)
+                elif status == "complete":
+                    break
+                elif status == "error":
+                    raise RuntimeError(f"Lightning TTS error: {msg.get('error', msg)}")
+                else:
+                    logger.warning(f"[tts] unknown message status: {msg}")
+            logger.info(
+                f"[tts] spoke {n_chunks} chunks ({n_bytes} bytes, "
+                f"{n_bytes / 2 / ACTOR_RATE_HZ:.1f}s audio) in {time.monotonic() - t0:.2f}s"
+            )

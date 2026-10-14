@@ -39,6 +39,7 @@ COPY gradium/pyproject.toml gradium/README.md ./gradium/
 COPY polyai/pyproject.toml polyai/README.md ./polyai/
 COPY gpt-live/pyproject.toml gpt-live/README.md ./gpt-live/
 COPY grok-cascade/pyproject.toml grok-cascade/README.md ./grok-cascade/
+COPY smallest/pyproject.toml smallest/README.md ./smallest/
 COPY grok-voice/pyproject.toml grok-voice/README.md ./grok-voice/
 COPY rory_tools ./rory_tools
 COPY vapi/rory_vapi ./vapi/rory_vapi

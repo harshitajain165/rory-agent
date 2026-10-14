@@ -25,6 +25,7 @@ members = [
     "rory-openai-realtime",
     "rory-pipecat",
     "rory-polyai",
+    "rory-smallest",
     "rory-vapi",
 ]
 
@@ -2535,6 +2536,7 @@ dev = [
     { name = "rory-openai-realtime" },
     { name = "rory-pipecat" },
     { name = "rory-polyai" },
+    { name = "rory-smallest" },
     { name = "rory-vapi" },
 ]
 test = [
@@ -2570,6 +2572,7 @@ dev = [
     { name = "rory-openai-realtime", editable = "openai-realtime" },
     { name = "rory-pipecat", editable = "pipecat" },
     { name = "rory-polyai", editable = "polyai" },
+    { name = "rory-smallest", editable = "smallest" },
     { name = "rory-vapi", editable = "vapi" },
 ]
 test = [{ name = "pytest", specifier = ">=8.0" }]
@@ -2985,6 +2988,35 @@ requires-dist = [
     { name = "rory-core", editable = "." },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
     { name = "websockets", specifier = ">=13" },
+]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.0" }]
+
+[[package]]
+name = "rory-smallest"
+version = "0.1.0"
+source = { editable = "smallest" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "openai" },
+    { name = "rory-core", extra = ["vad"] },
+    { name = "uvicorn", extra = ["standard"] },
+    { name = "websockets" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "openai", specifier = ">=1.60" },
+    { name = "rory-core", extras = ["vad"], editable = "." },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
+    { name = "websockets", specifier = ">=14" },
 ]
 
 [package.metadata.requires-dev]
