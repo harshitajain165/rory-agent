@@ -240,7 +240,15 @@ class _Call:
                         # before this one has even started running.
                         self._voiced = False
                         self._silence_s = 0.0
-                        self._endpointing = asyncio.create_task(self._endpoint())
+                        if self._endpointing is None or self._endpointing.done():
+                            self._endpointing = asyncio.create_task(self._endpoint())
+                        # else: a finalize is already in flight (the caller
+                        # paused, resumed, and paused again before it resolved).
+                        # Two concurrent _endpoint() calls would both wait on
+                        # the same _finalize_ack and could both fire on one
+                        # ack — the pending one already picks up whatever
+                        # _latest_transcript holds once it resolves, so a
+                        # second is never needed.
 
                 await self._stt.send(frame)
         except WebSocketDisconnect as exc:

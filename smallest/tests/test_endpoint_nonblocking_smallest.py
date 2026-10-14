@@ -98,3 +98,45 @@ def test_pump_keeps_forwarding_frames_while_finalize_is_unacknowledged(monkeypat
     assert len(call._stt.sent) == n_frames + 1  # every frame, plus the finalize control message
     assert json.dumps({"type": "finalize"}) in call._stt.sent
     assert call._endpointing is not None
+
+
+def test_a_second_pause_does_not_schedule_an_overlapping_endpoint(monkeypatch):
+    """Resume-then-pause-again before the first finalize acks must not double-fire.
+
+    Two concurrent _endpoint() calls would both await the same _finalize_ack
+    and could both wake on a single ack, each reading/clearing
+    _latest_transcript and potentially both dispatching a turn — a duplicate
+    or corrupted turn. Only one finalize should ever be in flight at a time.
+    """
+    monkeypatch.setattr(agent, "FINALIZE_TIMEOUT_S", 5.0)
+
+    silence = [False] * FRAMES_TO_ENDPOINT
+    # voiced, pause past the threshold, resume, pause past the threshold again —
+    # all before the first finalize could plausibly have acked.
+    pattern = [True] + silence + [True] + silence + [False] * EXTRA_FRAMES_AFTER
+    frames = [bytes(FRAME_BYTES) for _ in pattern]
+
+    call = agent._Call(_FakeActorWS(frames))
+    call._vad = _FakeVad(pattern)
+    call._stt = _FakeSTTSocket()
+    # _finalize_ack is never set, simulating the first finalize still pending
+    # when the second pause would otherwise have triggered another one.
+
+    async def scenario():
+        try:
+            await asyncio.wait_for(call._pump_actor_to_stt(), timeout=1.0)
+        finally:
+            if call._endpointing is not None:
+                call._endpointing.cancel()
+                await asyncio.gather(call._endpointing, return_exceptions=True)
+
+    try:
+        asyncio.run(scenario())
+    except TimeoutError:
+        pytest.fail("the pump stalled — see test_pump_keeps_forwarding_frames_...")
+
+    finalize_count = call._stt.sent.count(json.dumps({"type": "finalize"}))
+    assert finalize_count == 1, (
+        f"expected exactly one finalize in flight, got {finalize_count} — "
+        "the second pause scheduled an overlapping _endpoint()"
+    )
