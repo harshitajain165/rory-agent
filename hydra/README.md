@@ -69,7 +69,7 @@ The image serves `/voice` and `/health` on `:8008`.
 |---|---|---|
 | `SMALLEST_API_KEY` | — | Required. Rides as a query parameter on the Hydra websocket URL. |
 | `HYDRA_MODEL` | `hydra-v1.1` | The model (and output sample rate) in the websocket URL. |
-| `HYDRA_VOICE` | `wren` | Voice name — one of `wren`, `sloane`, `marlowe`, `reed`, `knox`, `tate`. |
+| `HYDRA_VOICE` | `kai` | Voice name. |
 | `STRIPE_API_KEY` | — | Sandbox fixture; the billing twin's credential. |
 | `FINERACT_USER` / `FINERACT_PASSWORD` / `FINERACT_TENANT` | `mifos` / `password` / `default` | Fineract's public OSS defaults. |
 

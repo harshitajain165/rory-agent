@@ -48,7 +48,7 @@ from rory_tools.prompt import GREETING, load_agent_prompt, today_context
 from .tools import TOOLS
 
 HYDRA_MODEL = os.environ.get("HYDRA_MODEL", "hydra-v1.1")
-HYDRA_VOICE = os.environ.get("HYDRA_VOICE", "wren")
+HYDRA_VOICE = os.environ.get("HYDRA_VOICE", "kai")
 
 # The actor's rate both ways. Hydra's input is pinned at 16 kHz no matter the
 # model version — the strict leg, documented as PCM16/mono/16 kHz or
